@@ -1,0 +1,10 @@
+.venv_bt/                                                                                                                                                                               
+__pycache__/
+*.pyc                                                                                                                                                                                   
+*.pyo                                                                                                                                                                                   
+*.egg-info/
+.DS_Store                                                                                                                                                                               
+*.json                                                    
+*.csv
+*.html
+*.log
