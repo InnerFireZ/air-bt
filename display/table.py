@@ -5,18 +5,13 @@ Responsive: adapts column set and widths to terminal size on every render.
 Created by InnerFireZ — https://github.com/InnerFireZ/air-bt
 """
 
+import shutil
 from datetime import datetime
-from rich.console import Console
 from rich.table import Table
-from rich.live import Live
-from rich.text import Text
 from rich.panel import Panel
-from rich.layout import Layout
 from rich import box
 
 from models import BTDevice
-
-console = Console()
 
 # Security score → color
 SCORE_COLOR = {
@@ -89,14 +84,15 @@ def _cve_cell(dev: BTDevice) -> str:
         return "[dim]-[/]"
     tc = _TYPE_COLORS.get(dev.known_vuln_type or "", "red")
     cnt = f"[dim]+{dev.vuln_count - 1}[/]" if dev.vuln_count > 1 else ""
-    return f"[{tc}]{dev.known_vuln}[/] [dim]{dev.known_vuln_type or ''}[/]{cnt}"
+    # Type is encoded in colour; omit the text to keep the cell narrow.
+    return f"[{tc}]{dev.known_vuln}[/]{cnt}"
 
 
 def build_main_table(devices: list[BTDevice], mode: str, elapsed: int,
                      probing_mac: str | None = None) -> Table:
     # ── Measure terminal width on every call so resize is instant ────────────
     try:
-        term_w = console.size.columns
+        term_w = shutil.get_terminal_size().columns
     except Exception:
         term_w = 120
 
@@ -119,21 +115,26 @@ def build_main_table(devices: list[BTDevice], mode: str, elapsed: int,
     show_seen     = standard or full
     show_last     = standard or full
 
-    # Dynamically scale FLAGS and CVE columns to fill remaining space
-    # Fixed columns consume roughly: MAC(18) RSSI(10) NAME(16) SEC(4)
-    # + optional: VENDOR(14) TYPE(7) PROTOCOL(14) SVC(4) W(7) R(7) N(6) CAPS(22) TXPWR(8) SEEN(5) LAST(8)
-    fixed = 18 + 10 + 16 + 4 + 4   # MAC RSSI NAME SEC + borders/padding
-    if show_vendor:   fixed += 14
-    if show_type:     fixed += 7
-    if show_protocol: fixed += 14
-    if show_gatt:     fixed += 4 + 7 + 7 + 6
-    if show_caps:     fixed += 22
-    if show_txpwr:    fixed += 8
-    if show_seen:     fixed += 5
-    if show_last:     fixed += 8
-    remaining = max(term_w - fixed, 30)
-    flags_w = max(int(remaining * 0.55), 20)
-    cve_w   = max(remaining - flags_w, 14)
+    # Exact accounting of every fixed-width column so remaining space for
+    # FLAGS and CVE is correct.  Column widths include Rich's 1-char padding
+    # on each side, so content area = width - 2.
+    #   width  5 → content 3  (fits 3-char headers like SVC, W/A, SEC)
+    #   width  6 → content 4  (fits SEEN header)
+    #   width 10 → content 8  (fits HH:MM:SS timestamp)
+    _fw = 18 + 10 + 14 + 5   # MAC(18) RSSI(10) NAME(14) SEC(5)
+    _fn = 4
+    if show_vendor:    _fw += 12; _fn += 1   # VENDOR
+    if show_type:      _fw += 7;  _fn += 1   # TYPE
+    if show_protocol:  _fw += 12; _fn += 1   # PROTO
+    if show_gatt:      _fw += 20; _fn += 4   # SVC(5)+W/A(5)+R/A(5)+NTF(5)
+    if show_caps:      _fw += 18; _fn += 1   # CAPS
+    if show_txpwr:     _fw += 8;  _fn += 1   # TXPWR
+    if show_seen:      _fw += 6;  _fn += 1   # SEEN
+    if show_last:      _fw += 10; _fn += 1   # LAST
+    # FLAGS + CVE add 2 more columns; total separators = (_fn + 2) - 1
+    remaining = max(term_w - _fw - (_fn + 1), 30)
+    cve_w   = max(int(remaining * 0.28), 12)
+    flags_w = max(remaining - cve_w, 20)
 
     probed = sum(1 for d in devices if d.gatt_enumerated)
     probe_status = (f"  [yellow]⟳ {probing_mac}[/]" if probing_mac
@@ -151,31 +152,34 @@ def build_main_table(devices: list[BTDevice], mode: str, elapsed: int,
     )
 
     # Always-visible columns
-    table.add_column("MAC",      style="cyan",         no_wrap=True, width=18)
+    table.add_column("MAC",      style="cyan",           no_wrap=True, width=18)
     if show_vendor:
-        table.add_column("VENDOR",   style="white",    no_wrap=True, width=14)
-    table.add_column("RSSI",     style="white",        width=10, justify="right")
+        table.add_column("VENDOR",   style="white",      no_wrap=True, width=12)
+    table.add_column("RSSI",     style="white",          width=10, justify="right")
     if show_type:
         table.add_column("TYPE",     style="bright_blue", no_wrap=True, width=7)
     if show_protocol:
-        table.add_column("PROTO",    style="magenta",  no_wrap=True, width=14)
-    table.add_column("NAME",     style="bright_white", no_wrap=True, width=16)
+        table.add_column("PROTO",    style="magenta",    no_wrap=True, width=12)
+    table.add_column("NAME",     style="bright_white",   no_wrap=True, width=14)
     if show_gatt:
-        table.add_column("SVC",  style="white",  width=4, justify="right")
-        table.add_column("W/A",  style="white",  width=4, justify="right")
-        table.add_column("R/A",  style="white",  width=4, justify="right")
-        table.add_column("NTF",  style="white",  width=4, justify="right")
+        # width=5 → content=3: fits 3-char headers (SVC, W/A, R/A, NTF) and 2-digit values
+        table.add_column("SVC",  style="white",  width=5, justify="right")
+        table.add_column("W/A",  style="white",  width=5, justify="right")
+        table.add_column("R/A",  style="white",  width=5, justify="right")
+        table.add_column("NTF",  style="white",  width=5, justify="right")
     if show_caps:
-        table.add_column("CAPS", style="bright_cyan",  width=22)
-    table.add_column("SEC",      style="white",        width=4,  justify="center")
-    table.add_column("FLAGS",    style="white",        width=flags_w)
-    table.add_column("CVE",      style="red",          width=cve_w)
+        table.add_column("CAPS", style="bright_cyan",    width=18)
+    table.add_column("SEC",      style="white",          width=5, justify="center")
+    table.add_column("FLAGS",    style="white",          width=flags_w)
+    table.add_column("CVE",      style="red",            width=cve_w)
     if show_txpwr:
-        table.add_column("TXPWR", style="dim",         width=8,  justify="right")
+        table.add_column("TXPWR", style="dim",           width=8, justify="right")
     if show_seen:
-        table.add_column("SEEN", style="dim",          width=5,  justify="right")
+        # width=6 → content=4: fits "SEEN" header and counts up to 9999
+        table.add_column("SEEN", style="dim",            width=6, justify="right")
     if show_last:
-        table.add_column("LAST", style="dim",          width=8)
+        # width=10 → content=8: fits "HH:MM:SS" without truncation
+        table.add_column("LAST", style="dim",            width=10)
 
     for dev in devices:
         is_probing  = probing_mac is not None and dev.mac == probing_mac
@@ -193,11 +197,11 @@ def build_main_table(devices: list[BTDevice], mode: str, elapsed: int,
         else:
             svc_count = open_w = open_r = notify = "[dim]-[/]"
 
-        caps_str  = _truncate(", ".join(dev.capabilities), 22) if dev.capabilities else "[dim]-[/]"
+        caps_str  = _truncate(", ".join(dev.capabilities), 18) if dev.capabilities else "[dim]-[/]"
         proto_col = _PROTO_COLORS.get(dev.protocol, "magenta")
-        proto_str = f"[{proto_col}]{_truncate(dev.protocol or '?', 14)}[/]"
+        proto_str = f"[{proto_col}]{_truncate(dev.protocol or '?', 12)}[/]"
         mac_cell  = f"[bold yellow]⟳ {dev.mac}[/]" if is_probing else dev.mac
-        name_cell = f"[yellow]{_truncate(dev.name or '?', 16)}[/]" if is_probing else _truncate(dev.name or "?", 16)
+        name_cell = f"[yellow]{_truncate(dev.name or '?', 14)}[/]" if is_probing else _truncate(dev.name or "?", 14)
 
         row = [mac_cell]
         if show_vendor:   row.append(_truncate(dev.vendor or "?", 14))

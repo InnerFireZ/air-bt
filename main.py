@@ -21,17 +21,26 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 from rich.prompt import Prompt, IntPrompt
-from rich.spinner import Spinner
-from rich.status import Status
 from rich import box
 
 from scanner.ble import BLEScanner
 from scanner.gatt import enumerate_gatt, subscribe_notifications
-from scanner.writer import exploit_open_writes, fuzz_characteristic, run_payload, elk_bledom_rainbow_poc
+from scanner.writer import (
+    exploit_open_writes, fuzz_characteristic, run_payload, elk_bledom_rainbow_poc,
+    probe_overflow, OverflowFinding,
+    fuzz_mutate, MutationResult,
+)
+from scanner.ble import is_random_mac
 from scanner.poc import (
     poc_generic_dump, poc_audio_device, poc_hid_injection,
     poc_iot_sensor, poc_smart_plug, poc_fitness_tracker,
     poc_health_monitor, poc_write_probe, run_best_poc,
+    poc_whisperpair,
+    poc_dfu_probe, poc_tuya_control, poc_govee_control,
+    poc_mibeacon_decode, poc_sweyntooth_probe,
+    poc_hearing_aid_probe, poc_blueborne_info,
+    poc_nordic_uart, poc_speaker_control, poc_smart_lock_probe, poc_ibeacon_track,
+    poc_reconnect_auth_bypass, ReconnectBypass,
 )
 from display.table import build_main_table, build_detail_panel
 from export import export_json, export_csv, export_html
@@ -305,6 +314,13 @@ def build_attack_menu(dev: BTDevice) -> list[dict]:
     def add(label: str, tag: str, desc: str = "", **kw):
         menu.append({"label": label, "tag": tag, "desc": desc, **kw})
 
+    # Pre-compute shared sets used throughout the menu builder
+    _matched_ids  = {v.cve_id for v in dev.matched_vulns}
+    _svc_set      = {s.uuid.lower() for s in dev.services}
+    _adv_set      = {u.lower() for u in dev.adv_uuids}
+    _char_uuids   = {c.uuid.lower() for c in dev.all_characteristics()}
+    _name_vendor  = ((dev.name or "") + " " + (dev.vendor or "")).lower()
+
     # ── Navigation
     add("Back to target list",         "back")
     add("Show full device details",    "details")
@@ -326,6 +342,10 @@ def build_attack_menu(dev: BTDevice) -> list[dict]:
     if dev.gatt_enumerated and dev.open_writes > 0:
         add("Exploit Open Writes",             "exploit",
             desc=f"Write test payloads to {dev.open_writes} unauthenticated writable chars")
+        add("Overflow / Boundary Probe",       "overflow_probe",
+            desc=f"Test {dev.open_writes} writable char(s) with escalating sizes 0→512B — finds missing length validation and crash bugs")
+        add("Mutation Fuzzer",                 "mutfuzz",
+            desc=f"Structured mutation fuzzing — bit flips, boundary bytes, length corruption (100 iters)")
         add("Fuzz Characteristics",            "fuzz",
             desc=f"Send random payloads to {dev.open_writes} writable chars (50 iterations)")
 
@@ -364,6 +384,152 @@ def build_attack_menu(dev: BTDevice) -> list[dict]:
     for p in proto_payloads:
         add(f"Payload: {p.name}",              "payload",
             desc=p.description, payload=p)
+
+    # ── DFU / OTA exposure
+    _dfu_svcs = {
+        "00001530-1212-efde-1523-785feabcd123",  # Nordic DFU
+        "1d14d6ee-fd63-4fa1-bfa4-8f47b42119f0",  # Silicon Labs Gecko OTA
+        "f000ffc0-0451-4000-b000-000000000000",  # TI OAD
+    }
+    if _dfu_svcs & (_svc_set | _adv_set):
+        add("DFU/OTA Exposure Probe",              "dfu_probe",
+            desc="Probe Nordic DFU / Silabs OTA / TI OAD — unauthenticated firmware update")
+
+    # ── Tuya BLE unauth control
+    _tuya_svc = "00001910-0000-1000-8000-00805f9b34fb"
+    if dev.protocol == "Tuya BLE" or _tuya_svc in _svc_set or "ADV-TUYA-001" in _matched_ids:
+        add("Tuya BLE Control PoC (ADV-TUYA-001)", "tuya_control",
+            desc="Send power/query commands without authentication via Tuya GATT service")
+
+    # ── Govee unauth control
+    _govee_svc = "00010203-0405-0607-0809-0a0b0c0d1910"
+    _govee_ctrl = "00010203-0405-0607-0809-0a0b0c0d2b11"
+    if _govee_svc in _svc_set or _govee_ctrl in _char_uuids or "CVE-2020-7958" in _matched_ids:
+        add("Govee Device Control PoC (CVE-2020-7958)", "govee_control",
+            desc="Control Govee smart lights/strips without authentication")
+
+    # ── MiBeacon data disclosure
+    _mi_uuid = "0000fe95-0000-1000-8000-00805f9b34fb"
+    _has_mi = (
+        any("fe95" in k.lower() for k in dev.service_data)
+        or _mi_uuid in _adv_set
+        or dev.protocol in ("MiBeacon", "Xiaomi")
+    )
+    if _has_mi:
+        add("MiBeacon Decode (ADV-MIBEACON-001)",   "mibeacon",
+            desc="Decode unencrypted sensor data broadcast by Xiaomi MiBeacon devices")
+
+    # ── SweynTooth / BrakTooth
+    _sweyn_cve_ids = {
+        "CVE-2019-16336", "CVE-2019-17517", "CVE-2019-17518", "CVE-2019-17519",
+        "CVE-2019-17520", "CVE-2021-28139", "CVE-2021-28135", "CVE-2021-28136",
+        "CVE-2019-17061",  "CVE-2021-28137",
+    }
+    _sweyn_keywords = ["nrf", "nordic", "esp32", "cypress", "telink", "dialog",
+                       "da14", "psoc", "cyw", "tlsr"]
+    _has_sweyn = (
+        bool(_sweyn_cve_ids & _matched_ids)
+        or any(kw in _name_vendor for kw in _sweyn_keywords)
+    )
+    if _has_sweyn and dev.gatt_enumerated:
+        add("SweynTooth/BrakTooth Crash Probe",    "sweyntooth",
+            desc="GATT-level stability probe for Link Layer crash CVEs (Nordic/ESP32/Cypress)")
+
+    # ── Medical hearing aid unauth access
+    _hearing_cves = {"CVE-2019-13473", "CVE-2019-13474"}
+    _hearing_kws  = ["signia", "siemens", "widex", "oticon", "phonak", "starkey",
+                     "hearing", "resound", "bernafon"]
+    _has_hearing = (
+        bool(_hearing_cves & _matched_ids)
+        or any(kw in _name_vendor for kw in _hearing_kws)
+    )
+    if _has_hearing:
+        add("Hearing Aid Unauth Probe (CVE-2019-13473/74)", "hearing_aid",
+            desc="Connect without pairing, read/write audio profiles on medical hearing aids")
+
+    # ── BlueBorne / BleedingTooth / BlueFrag
+    _blueborne_cves = {
+        "CVE-2017-1000251", "CVE-2017-1000250", "CVE-2017-0781", "CVE-2017-0782",
+        "CVE-2020-12351",   "CVE-2020-12352",   "CVE-2020-0022",
+        "CVE-2019-8648",    "CVE-2022-30190",   "CVE-2024-21306",
+    }
+    if _blueborne_cves & _matched_ids:
+        add("BlueBorne/BleedingTooth Report",      "blueborne_info",
+            desc="Classic BT L2CAP CVE report — l2ping reachability test + remediation notes")
+
+    # ── Nordic UART injection (ADV-UART-001, ADV-UART-002)
+    _nus_svc = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+    _has_nus = (
+        _nus_svc in _svc_set
+        or _nus_svc in _adv_set
+        or dev.protocol == "Nordic UART"
+        or bool({"ADV-UART-001", "ADV-UART-002"} & _matched_ids)
+    )
+    if _has_nus:
+        add("Nordic UART Command Injection (ADV-UART-002)", "nordic_uart",
+            desc="Send AT/binary probes to unauthenticated NUS RX char, capture responses")
+
+    # ── BLE VCS speaker control (ADV-SPEAKER-002)
+    _vcs_svc = "00001844-0000-1000-8000-00805f9b34fb"
+    _vcs_cp  = "00002b7e-0000-1000-8000-00805f9b34fb"
+    _has_vcs = _vcs_svc in _svc_set or _vcs_cp in _char_uuids or "ADV-SPEAKER-002" in _matched_ids
+    if _has_vcs:
+        add("BLE Speaker Volume Control PoC (ADV-SPEAKER-002)", "speaker_control",
+            desc="Mute/set volume via unauthenticated Volume Control Service (VCS)")
+
+    # ── Smart lock access probe (ADV-LOCK-001)
+    _lock_svcs = {
+        "00003a77-0000-1000-8000-00805f9b34fb",
+        "9a66f400-0084-42da-aed1-bc60b8a02476",
+        "a92ee100-5501-11e4-916c-0800200c9a66",
+        "4fafc201-1fb5-459e-8fcc-c5c9c331914b",
+    }
+    _lock_kws = ["lock", "deadbolt", "padlock", "door", "entry", "august",
+                 "schlage", "yale", "kwikset", "noke", "igloohome", "ultraloq"]
+    _has_lock = (
+        bool(_lock_svcs & _svc_set)
+        or any(kw in _name_vendor for kw in _lock_kws)
+    )
+    if _has_lock:
+        add("Smart Lock Unauth Probe (ADV-LOCK-001)", "smart_lock",
+            desc="Read-only recon: enumerate accessible data without authentication (no unlock)")
+
+    # ── iBeacon / Eddystone / Tile passive decode (ADV-IBEACON-001)
+    _has_beacon = (
+        0x004C in dev.manufacturer_data        # Apple iBeacon / AirTag / FindMy
+        or any("feaa" in k.lower() for k in dev.service_data)   # Eddystone
+        or any("feed" in u.lower() for u in dev.adv_uuids)      # Tile
+        or dev.protocol in ("iBeacon", "Eddystone", "Eddystone-UID", "Eddystone-URL", "Eddystone-TLM")
+    )
+    if _has_beacon:
+        add("iBeacon/Eddystone/Tile Passive Decode (ADV-IBEACON-001)", "ibeacon_track",
+            desc="Parse beacon UUID/major/minor, Eddystone URL/UID/TLM, Tile presence — no connection needed")
+
+    # ── WhisperPair (CVE-2025-36911)
+    # Show whenever the CVE already matched (name-based: Sony/Jabra/JBL/etc.) OR
+    # the Fast Pair service UUID is visible.  Many headphones only advertise 0xfe2c
+    # when in pairing mode, so the UUID check alone misses most real targets.
+    _fp_svc = "0000fe2c-0000-1000-8000-00805f9b34fb"
+    _has_fp = (
+        _fp_svc in [s.uuid.lower() for s in dev.services]
+        or _fp_svc in [u.lower() for u in dev.adv_uuids]
+        or dev.protocol == "Google Fast Pair"
+        or "CVE-2025-36911" in _matched_ids
+    )
+    if _has_fp:
+        add("WhisperPair PoC (CVE-2025-36911)",    "whisperpair",
+            desc="Probe Fast Pair KBP auth bypass — extract leaked BR/EDR address")
+
+    # ── Reconnection auth-bypass probe
+    if dev.gatt_enumerated:
+        _auth_gated_count = sum(
+            1 for c in dev.all_characteristics()
+            if ("read" in c.properties and not c.readable_without_auth)
+            or ({"write", "write-without-response"} & set(c.properties) and not c.writable_without_auth)
+        )
+        if _auth_gated_count > 0:
+            add("Reconnection Auth-Bypass Probe (BLESA-style)", "reconnect_bypass",
+                desc=f"Test {_auth_gated_count} auth-gated char(s) — does device skip re-auth on reconnect?")
 
     # ── Auto best PoC
     if dev.gatt_enumerated:
@@ -433,11 +599,15 @@ def show_attack_menu(dev: BTDevice, menu: list[dict]):
         tag = item["tag"]
         if tag == "back":
             t.add_row("0", f"[dim]{item['label']}[/]", "")
-        elif tag in ("exploit", "elk_rainbow", "poc_hid", "poc_write_probe"):
+        elif tag in ("exploit", "elk_rainbow", "poc_hid", "poc_write_probe", "whisperpair",
+                     "dfu_probe", "tuya_control", "govee_control", "sweyntooth",
+                     "hearing_aid", "blueborne_info", "nordic_uart", "speaker_control",
+                     "smart_lock", "ibeacon_track"):
             t.add_row(str(i), f"[bright_red]{item['label']}[/]", item.get("desc", ""))
         elif tag in ("fuzz",):
             t.add_row(str(i), f"[red]{item['label']}[/]", item.get("desc", ""))
-        elif tag in ("notify", "poc_audio", "poc_sensor", "poc_fitness", "poc_health", "poc_plug", "poc_generic", "auto_poc"):
+        elif tag in ("notify", "poc_audio", "poc_sensor", "poc_fitness", "poc_health", "poc_plug",
+                     "poc_generic", "auto_poc", "mibeacon"):
             t.add_row(str(i), f"[cyan]{item['label']}[/]", item.get("desc", ""))
         elif tag == "gatt":
             t.add_row(str(i), f"[green]{item['label']}[/]", item.get("desc", ""))
@@ -487,9 +657,6 @@ async def run_attack(scanner: BLEScanner, dev: BTDevice, choice: dict, args) -> 
     # All connection-based attacks need scanner stopped
     await scanner.pause()
     try:
-        with console.status(f"[cyan]Connecting to {dev.mac}...[/]", spinner="dots"):
-            pass  # status shown during actual call below
-
         if tag == "gatt":
             console.print(f"\n[cyan]Enumerating GATT on {dev.mac}...[/]")
             ok = await enumerate_gatt(dev, timeout=args.timeout)
@@ -531,6 +698,35 @@ async def run_attack(scanner: BLEScanner, dev: BTDevice, choice: dict, args) -> 
                     results = await fuzz_characteristic(dev, char.uuid, iterations=50, timeout=args.timeout)
                     _show_write_results(results)
 
+        elif tag == "mutfuzz":
+            writable = [c for c in dev.all_characteristics() if c.writable_without_auth]
+            if not writable:
+                console.print("[yellow]No writable-without-auth chars found.[/]")
+            else:
+                console.print(f"\n[bright_red]Mutation Fuzzer on {dev.mac} — {len(writable)} char(s), 100 iters each...[/]")
+                all_mut: list = []
+                for char in writable:
+                    mut_results = await fuzz_mutate(
+                        dev, char.uuid, iterations=100, timeout=args.timeout,
+                        log_cb=lambda m: console.print(f"  {m}"),
+                    )
+                    all_mut.extend(mut_results)
+                _show_mutation_results(all_mut)
+
+        elif tag == "overflow_probe":
+            console.print(f"\n[bright_red]Overflow / Boundary Probe on {dev.mac}...[/]")
+            findings = await probe_overflow(dev, timeout=args.timeout,
+                                            log_cb=lambda m: console.print(f"  {m}"))
+            _show_overflow_results(findings)
+
+        elif tag == "reconnect_bypass":
+            console.print(f"\n[bright_red]Reconnection Auth-Bypass Probe on {dev.mac}...[/]")
+            rb_findings = await poc_reconnect_auth_bypass(
+                dev, timeout=args.timeout,
+                log_cb=lambda m: console.print(f"  {m}"),
+            )
+            _show_reconnect_results(rb_findings)
+
         elif tag == "elk_rainbow":
             console.print(f"\n[bright_red]ELK-BLEDOM Rainbow PoC on {dev.mac}...[/]")
             results = await elk_bledom_rainbow_poc(dev, timeout=args.timeout,
@@ -569,6 +765,80 @@ async def run_attack(scanner: BLEScanner, dev: BTDevice, choice: dict, args) -> 
             console.print(f"\n[red]Write Probe on {dev.mac}...[/]")
             await poc_write_probe(dev, log_cb=lambda m: console.print(f"  {m}"), timeout=args.timeout)
 
+        elif tag == "whisperpair":
+            console.print(f"\n[bright_red]WhisperPair PoC (CVE-2025-36911) on {dev.mac}...[/]")
+            results = await poc_whisperpair(
+                dev, log_cb=lambda m: console.print(f"  {m}"),
+                timeout=args.timeout, adapter=args.adapter,
+            )
+            _show_write_results(results)
+
+        elif tag == "dfu_probe":
+            console.print(f"\n[bright_red]DFU/OTA Exposure Probe on {dev.mac}...[/]")
+            results = await poc_dfu_probe(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                          timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "tuya_control":
+            console.print(f"\n[bright_red]Tuya BLE Control PoC on {dev.mac}...[/]")
+            results = await poc_tuya_control(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                             timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "govee_control":
+            console.print(f"\n[bright_red]Govee Control PoC (CVE-2020-7958) on {dev.mac}...[/]")
+            results = await poc_govee_control(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                              timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "mibeacon":
+            console.print(f"\n[cyan]MiBeacon Decode on {dev.mac}...[/]")
+            results = await poc_mibeacon_decode(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                                timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "sweyntooth":
+            console.print(f"\n[bright_red]SweynTooth/BrakTooth Probe on {dev.mac}...[/]")
+            results = await poc_sweyntooth_probe(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                                 timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "hearing_aid":
+            console.print(f"\n[bright_red]Hearing Aid Unauth Probe on {dev.mac}...[/]")
+            results = await poc_hearing_aid_probe(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                                  timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "blueborne_info":
+            console.print(f"\n[bright_red]BlueBorne/BleedingTooth Report for {dev.mac}...[/]")
+            results = await poc_blueborne_info(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                               timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "nordic_uart":
+            console.print(f"\n[bright_red]Nordic UART Command Injection on {dev.mac}...[/]")
+            results = await poc_nordic_uart(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                            timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "speaker_control":
+            console.print(f"\n[bright_red]BLE Speaker Volume Control PoC on {dev.mac}...[/]")
+            results = await poc_speaker_control(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                                timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "smart_lock":
+            console.print(f"\n[bright_red]Smart Lock Unauth Probe on {dev.mac}...[/]")
+            results = await poc_smart_lock_probe(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                                 timeout=args.timeout)
+            _show_write_results(results)
+
+        elif tag == "ibeacon_track":
+            console.print(f"\n[bright_red]iBeacon/Eddystone/Tile Passive Decode on {dev.mac}...[/]")
+            results = await poc_ibeacon_track(dev, log_cb=lambda m: console.print(f"  {m}"),
+                                              timeout=args.timeout)
+            _show_write_results(results)
+
         elif tag == "auto_poc":
             console.print(f"\n[cyan]Auto PoC on {dev.mac}...[/]")
             await run_best_poc(dev, log_cb=lambda m: console.print(f"  {m}"), timeout=args.timeout)
@@ -597,6 +867,176 @@ def _show_write_results(results):
     for r in results:
         color = "green" if r.success else "dim"
         console.print(f"  [{color}]{r}[/]")
+
+
+def _show_overflow_results(findings: list):
+    if not findings:
+        console.print("  [dim]No overflow findings.[/]")
+        return
+
+    _sev_color = {
+        "CRITICAL": "bright_red",
+        "HIGH":     "red",
+        "MEDIUM":   "yellow",
+        "LOW":      "dim",
+        "INFO":     "dim",
+    }
+    _sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+    critical = [f for f in findings if f.severity == "CRITICAL"]
+    high     = [f for f in findings if f.severity == "HIGH"]
+    medium   = [f for f in findings if f.severity == "MEDIUM"]
+
+    console.print()
+    if critical:
+        console.print(f"  [bright_red bold]⚠  {len(critical)} CRITICAL — device crashed during probe[/]")
+    if high:
+        console.print(f"  [red bold]▲  {len(high)} HIGH — oversized write accepted or device disconnected[/]")
+    if medium:
+        console.print(f"  [yellow]●  {len(medium)} MEDIUM — zero-length accepted or over-MTU write accepted[/]")
+
+    console.print()
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        batch = sorted([f for f in findings if f.severity == sev], key=lambda f: f.size)
+        if not batch:
+            continue
+        c = _sev_color[sev]
+        for f in batch:
+            crash_note = ""
+            if f.crashed is True:
+                crash_note = "  [bright_red]← DEVICE CRASHED[/]"
+            elif f.crashed is False:
+                crash_note = "  [yellow]← recovered[/]"
+            short_uuid = f.char_uuid.upper()[:8] + "…"
+            console.print(
+                f"  [{c}][{sev:8}][/]  {short_uuid}  "
+                f"[white]{f.size:>4}B[/]  {f.detail}{crash_note}"
+            )
+
+    console.print()
+    total = len(findings)
+    actionable = len(critical) + len(high) + len(medium)
+    console.print(f"  [bold]Total: {total} findings  ({actionable} actionable)[/]")
+
+
+def _show_mutation_results(results: list):
+    if not results:
+        console.print("  [dim]No mutation results.[/]")
+        return
+
+    accepted    = sum(1 for r in results if r.outcome == "accepted")
+    rejected    = sum(1 for r in results if r.outcome == "rejected")
+    timeouts    = sum(1 for r in results if r.outcome == "timeout")
+    disconnects = sum(1 for r in results if r.outcome == "disconnect")
+    crashes     = sum(1 for r in results if r.crashed)
+
+    console.print()
+    console.print(f"  [bold]Mutations: {len(results)}[/]  "
+                  f"accept=[green]{accepted}[/]  reject=[dim]{rejected}[/]  "
+                  f"timeout=[yellow]{timeouts}[/]  disc=[red]{disconnects}[/]  "
+                  f"crash=[bright_red]{crashes}[/]")
+
+    # ATT error breakdown
+    err_counts: dict[str, int] = {}
+    for r in results:
+        if r.att_error:
+            err_counts[r.att_error] = err_counts.get(r.att_error, 0) + 1
+    if err_counts:
+        from scanner.writer import _ATT_DESCRIPTIONS
+        console.print()
+        console.print("  [bold]ATT error codes seen:[/]")
+        for code, cnt in sorted(err_counts.items(), key=lambda x: -x[1]):
+            desc  = _ATT_DESCRIPTIONS.get(code, "Unknown")
+            color = "yellow" if code == "0x0e" else ("green" if code in ("0x0d", "0x05", "0x0f") else "dim")
+            console.print(f"    [{color}]{code}[/]  {desc:<35}  ×{cnt}")
+
+    # Strategy acceptance heatmap
+    strat_acc: dict[str, int] = {}
+    strat_tot: dict[str, int] = {}
+    for r in results:
+        strat_tot[r.strategy] = strat_tot.get(r.strategy, 0) + 1
+        if r.outcome == "accepted":
+            strat_acc[r.strategy] = strat_acc.get(r.strategy, 0) + 1
+    if strat_acc:
+        console.print()
+        console.print("  [bold]Strategies with accepted writes:[/]")
+        for strat, cnt in sorted(strat_acc.items(), key=lambda x: -x[1]):
+            tot  = strat_tot.get(strat, 0)
+            pct  = int(cnt / tot * 100) if tot else 0
+            bar  = "█" * (pct // 10)
+            console.print(f"    [cyan]{strat:16}[/]  {bar:<10} {pct:3}%  ({cnt}/{tot})")
+
+    # Notable events
+    notable = [r for r in results if r.is_notable or r.crashed]
+    if notable:
+        console.print()
+        console.print(f"  [bold red]Notable events ({len(notable)}):[/]")
+        for r in notable[:15]:
+            c = "bright_red" if r.crashed else ("red" if r.outcome == "disconnect" else "yellow")
+            crash_mark = "  [bright_red]← CRASHED[/]" if r.crashed else ""
+            console.print(
+                f"    [{c}]#{r.iteration:3}[/]  [{r.strategy:15}]  "
+                f"[white]{r.payload.hex()[:24]}[/]  → {r.outcome.upper()}{crash_mark}"
+            )
+
+
+def _show_reconnect_results(findings: list):
+    if not findings:
+        console.print("  [dim]No reconnect findings.[/]")
+        return
+
+    _sev_color = {"CRITICAL": "bright_red", "HIGH": "red", "MEDIUM": "yellow",
+                  "LOW": "dim", "INFO": "dim"}
+
+    bypasses  = [f for f in findings if f.bypass]
+    criticals = [f for f in findings if f.severity == "CRITICAL"]
+    highs     = [f for f in findings if f.severity == "HIGH"]
+
+    console.print()
+    if criticals:
+        console.print(f"  [bright_red bold]⚠  {len(criticals)} CRITICAL — write bypass: unauthenticated control without pairing[/]")
+    if highs and not criticals:
+        console.print(f"  [red bold]▲  {len(highs)} HIGH — read bypass or inconsistent auth enforcement[/]")
+    if not bypasses:
+        console.print("  [green]✓  No auth bypass detected — device correctly re-challenges on reconnect[/]")
+
+    # Phase comparison table header
+    console.print()
+    console.print(f"  [dim]{'UUID':36}  {'OP':5}  {'Phase1':8}  {'Phase2 (imm)':12}  {'Phase3 (3s)':11}[/]")
+    console.print(f"  [dim]{'─'*36}  {'─'*5}  {'─'*8}  {'─'*12}  {'─'*11}[/]")
+
+    outcome_color = {
+        "allowed":  "bright_red",
+        "blocked":  "green",
+        "error":    "dim",
+        "timeout":  "yellow",
+        "skipped":  "dim",
+    }
+
+    for f in sorted(findings, key=lambda x: (x.severity != "CRITICAL", x.severity != "HIGH", x.char_uuid)):
+        c   = _sev_color.get(f.severity, "white")
+        p1c = outcome_color.get(f.phase1, "white")
+        p2c = outcome_color.get(f.phase2, "white")
+        p3c = outcome_color.get(f.phase3, "white")
+        bypass_mark = "  [bright_red]← BYPASS[/]" if f.bypass else ""
+        console.print(
+            f"  [{c}]{f.char_uuid[:36]:36}[/]  "
+            f"{f.operation:5}  "
+            f"[{p1c}]{f.phase1:8}[/]  "
+            f"[{p2c}]{f.phase2:12}[/]  "
+            f"[{p3c}]{f.phase3:11}[/]"
+            f"{bypass_mark}"
+        )
+        if f.read_value:
+            hex_val = f.read_value.hex()
+            try:
+                txt = f.read_value.decode("utf-8", errors="replace").strip()
+                console.print(f"  [dim]  └ value: {hex_val}  ({txt})[/]")
+            except Exception:
+                console.print(f"  [dim]  └ value: {hex_val}[/]")
+
+    console.print()
+    console.print(f"  [bold]Total: {len(findings)} finding(s)  |  {len(bypasses)} bypass(es)[/]")
 
 
 def _show_cve_details(dev: BTDevice):
@@ -658,6 +1098,14 @@ async def main():
 
             dev: BTDevice = choice
 
+            # Warn about random/private MACs (iOS RPA, Android) upfront
+            if is_random_mac(dev.mac):
+                console.print(
+                    f"\n[yellow]⚠ {dev.mac} uses a BLE random/private address (detected from BlueZ).[/]\n"
+                    f"  [dim]iOS and Android rotate this address after unauthenticated disconnects.[/]\n"
+                    f"  [dim]If connections fail with 'Device not found', rescan to re-discover.[/]"
+                )
+
             # Auto-probe on first visit if not yet done
             if not dev.gatt_enumerated:
                 console.print(f"\n[cyan]Probing {dev.mac} ({dev.name})...[/]")
@@ -667,7 +1115,11 @@ async def main():
                     if ok:
                         scanner._compute_sec_score(dev)
                     else:
-                        console.print(f"[yellow]Could not connect to {dev.mac} — showing passive findings only[/]")
+                        msg = (f"[yellow]Could not connect to {dev.mac} — showing passive findings only[/]")
+                        if is_random_mac(dev.mac):
+                            msg += ("\n  [dim]Tip: random-MAC devices (iOS/Android) often reject unauthenticated "
+                                    "connections or rotate address immediately. Try while screen is unlocked.[/]")
+                        console.print(msg)
                 finally:
                     await scanner.resume()
 

@@ -10,10 +10,23 @@ Created by InnerFireZ — https://github.com/InnerFireZ/air-bt
 
 import asyncio
 import logging
+import struct
 from bleak import BleakClient, BleakError
+from bleak.exc import BleakDeviceNotFoundError
 from bleak.backends.characteristic import BleakGATTCharacteristic
 
 from models import BTDevice, GATTService, GATTCharacteristic
+from scanner.ble import get_cached_ble_device, clear_cached_ble_device, is_random_mac
+
+
+def _bleak_target(dev: BTDevice):
+    """Prefer the cached BLEDevice object over raw MAC string.
+
+    BleakClient accepts either a MAC string or a BLEDevice.  Using the BLEDevice
+    avoids a BlueZ cache lookup by MAC and survives scanner.pause() gaps as long
+    as the device hasn't rotated its address since the last advertisement.
+    """
+    return get_cached_ble_device(dev.mac) or dev.mac
 from data.uuids import resolve_uuid, get_capabilities_from_uuids
 from data.cve import match_vulns
 from data.protocols import detect_protocol
@@ -34,7 +47,7 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
     log.info(f"GATT probe: {dev.mac} ({dev.name})")
 
     try:
-        async with BleakClient(dev.mac, timeout=timeout, pair=False) as client:
+        async with BleakClient(_bleak_target(dev), timeout=timeout, pair=False) as client:
             if not client.is_connected:
                 log.warning(f"Could not connect to {dev.mac}")
                 return False
@@ -58,9 +71,30 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
                         description=char_name,
                     )
 
-                    # Detect write capability without auth
+                    # Probe write capability without auth — mirrors the read probe above.
+                    # A single zero byte is written; auth errors → not open, anything
+                    # else (success or non-auth failure) → flag as open.
                     if "write" in props or "write-without-response" in props:
-                        gatt_char.writable_without_auth = True
+                        try:
+                            no_resp = "write-without-response" in props
+                            await asyncio.wait_for(
+                                client.write_gatt_char(char.handle, bytes([0x00]),
+                                                       response=not no_resp),
+                                timeout=READ_TIMEOUT,
+                            )
+                            gatt_char.writable_without_auth = True
+                        except asyncio.TimeoutError:
+                            log.debug(f"Write timeout: {char_uuid}")
+                        except BleakError as e:
+                            err = str(e).lower()
+                            if "authentication" in err or "encrypt" in err or \
+                                    "insufficient" in err or "not permitted" in err:
+                                log.debug(f"Auth required for write: {char_uuid}")
+                            else:
+                                gatt_char.writable_without_auth = True
+                                log.debug(f"Write error (non-auth) {char_uuid}: {e}")
+                        except Exception as e:
+                            log.debug(f"Unexpected write error {char_uuid}: {e}")
 
                     # Attempt unauthenticated read
                     if "read" in props:
@@ -112,7 +146,6 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
                     if field_name == "battery" and raw:
                         dev.battery = raw[0]
                     elif field_name == "temperature" and len(raw) >= 2:
-                        import struct
                         dev.temperature = round(struct.unpack_from("<h", raw)[0] / 100.0, 1)
                     elif field_name in ("manufacturer_name", "model_number", "firmware"):
                         try:
@@ -135,8 +168,10 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
             if dev.notifiable > 0 and "NOTIFY_UNAUTH" not in dev.sec_flags:
                 dev.sec_flags.append("NOTIFY_UNAUTH")
 
-            # Check if device never requested pairing (connected without any auth prompt)
-            if "NO_BONDING" not in dev.sec_flags:
+            # NO_BONDING: device allowed at least one read or write without pairing.
+            # A bare connection with pair=False only means the device accepted
+            # the link; we only flag it if actual GATT access succeeded unauthenticated.
+            if (dev.open_reads > 0 or dev.open_writes > 0) and "NO_BONDING" not in dev.sec_flags:
                 dev.sec_flags.append("NO_BONDING")
 
             # Re-detect protocol from real GATT services (many devices hide UUIDs until connected)
@@ -159,7 +194,7 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
             # active_probe=True unlocks BLESA and other probe-only CVEs
             vulns = match_vulns(dev.name, all_uuids, dev.device_type, active_probe=True)
             if vulns:
-                dev.known_vuln = vulns[0].cve_id
+                dev.known_vuln = vulns[0].short_name or vulns[0].cve_id
                 dev.known_vuln_type = vulns[0].vuln_type
                 dev.vuln_count = len(vulns)
                 dev.matched_vulns = vulns
@@ -178,7 +213,24 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
     except asyncio.TimeoutError:
         log.warning(f"Connection timeout: {dev.mac}")
     except BleakError as e:
-        log.warning(f"BleakError {dev.mac}: {e}")
+        _is_not_found = (
+            isinstance(e, BleakDeviceNotFoundError)
+            or "not found" in str(e).lower()
+        )
+        if _is_not_found:
+            clear_cached_ble_device(dev.mac)
+            if is_random_mac(dev.mac):
+                log.warning(
+                    f"Device not found: {dev.mac} — random/private MAC may have rotated "
+                    f"(iOS/Android RPA). Rescan to re-discover."
+                )
+            else:
+                log.warning(
+                    f"Device not found: {dev.mac} — out of range or BlueZ cache expired. "
+                    f"Rescan to re-discover."
+                )
+        else:
+            log.warning(f"BleakError {dev.mac}: {e}")
     except Exception as e:
         log.warning(f"Unexpected error {dev.mac}: {e}")
 
@@ -203,7 +255,7 @@ async def subscribe_notifications(
     log.info(f"Subscribing to {len(notifiable_chars)} chars on {dev.mac}")
 
     try:
-        async with BleakClient(dev.mac, timeout=timeout, pair=False) as client:
+        async with BleakClient(_bleak_target(dev), timeout=timeout, pair=False) as client:
             if not client.is_connected:
                 return
 
@@ -226,5 +278,18 @@ async def subscribe_notifications(
                 except Exception:
                     pass
 
+    except BleakError as e:
+        _is_not_found = (
+            isinstance(e, BleakDeviceNotFoundError)
+            or "not found" in str(e).lower()
+        )
+        if _is_not_found:
+            clear_cached_ble_device(dev.mac)
+            hint = ("random/private MAC may have rotated (RPA)"
+                    if is_random_mac(dev.mac)
+                    else "out of range or BlueZ cache expired")
+            log.warning(f"Notification stream {dev.mac}: device not found — {hint}. Rescan.")
+        else:
+            log.warning(f"Notification stream error {dev.mac}: {e}")
     except Exception as e:
         log.warning(f"Notification stream error {dev.mac}: {e}")

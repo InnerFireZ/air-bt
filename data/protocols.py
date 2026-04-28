@@ -97,12 +97,9 @@ def detect_protocol(
         if payload and payload[0] == 0x03:
             return "MS Swift Pair"
 
-    # --- Generic Chinese OEM heuristics ---
-    if any(k in [0xFFFF, 0xFFF0, 0xFF00] for k in manufacturer_data):
-        return "Generic Chinese OEM"
-
     # --- ELK-BLEDOM / Chinese BLE LED strips (no-auth RGB control) ---
-    # Service UUID FFF0 + write char FFF3 is the standard ELK-BLEDOM fingerprint
+    # Must be checked before Generic Chinese OEM: ELK-BLEDOM devices advertise
+    # 0xFFF0 in manufacturer data and would otherwise be misclassified.
     if any(u in uuids_lower for u in [
         "0000fff0-0000-1000-8000-00805f9b34fb",
         "0000ffe5-0000-1000-8000-00805f9b34fb",
@@ -115,6 +112,10 @@ def detect_protocol(
         "ble-led", "iled", "ilis", "smlight", "sovvid",
     ]):
         return "ELK-BLEDOM"
+
+    # --- Generic Chinese OEM heuristics ---
+    if any(k in [0xFFFF, 0xFFF0, 0xFF00] for k in manufacturer_data):
+        return "Generic Chinese OEM"
 
     # Name-based fallbacks
     if any(kw in name_lower for kw in ["mi ", "xiaomi", "redmi"]):

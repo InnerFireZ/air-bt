@@ -31,6 +31,7 @@ class BLEVuln:
     vuln_type: str               # RCE / DoS / AuthBypass / InfoDisc / UnauthWrite / OTA / Spoof / Inject
     affected_bt_type: str = "Any"  # "Classic", "BLE", "Dual", "Any"
     requires_active_probe: bool = False  # if True, only match after GATT enumeration
+    short_name: str = ""           # friendly display label; falls back to cve_id if empty
 
 
 # Severity sort order for picking the worst match
@@ -53,6 +54,7 @@ VULN_DB: list[BLEVuln] = [
         severity="CRITICAL",
         vuln_type="RCE",
         affected_bt_type="Classic",
+        short_name="BlueBorne",
     ),
     BLEVuln(
         cve_id="CVE-2017-1000250",
@@ -122,6 +124,7 @@ VULN_DB: list[BLEVuln] = [
         severity="CRITICAL",
         vuln_type="RCE",
         affected_bt_type="Classic",
+        short_name="BleedingTooth",
     ),
     BLEVuln(
         cve_id="CVE-2020-12352",
@@ -170,6 +173,7 @@ VULN_DB: list[BLEVuln] = [
         severity="HIGH",
         vuln_type="DoS",
         affected_bt_type="Classic",
+        short_name="BrakTooth",
     ),
     BLEVuln(
         cve_id="CVE-2021-34145",
@@ -343,6 +347,7 @@ VULN_DB: list[BLEVuln] = [
         severity="CRITICAL",
         vuln_type="RCE",
         affected_bt_type="BLE",
+        short_name="BleedingBit",
     ),
     BLEVuln(
         cve_id="CVE-2018-7080",
@@ -369,6 +374,7 @@ VULN_DB: list[BLEVuln] = [
         severity="HIGH",
         vuln_type="AuthBypass",
         affected_bt_type="Classic",
+        short_name="KNOB",
     ),
     BLEVuln(
         cve_id="CVE-2020-10135",
@@ -380,6 +386,7 @@ VULN_DB: list[BLEVuln] = [
         severity="HIGH",
         vuln_type="AuthBypass",
         affected_bt_type="Classic",
+        short_name="BIAS",
     ),
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -397,6 +404,7 @@ VULN_DB: list[BLEVuln] = [
         vuln_type="AuthBypass",
         affected_bt_type="BLE",
         requires_active_probe=True,
+        short_name="BLUFFS",
     ),
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -413,6 +421,7 @@ VULN_DB: list[BLEVuln] = [
         vuln_type="Spoof",
         affected_bt_type="BLE",
         requires_active_probe=True,
+        short_name="BLESA",
     ),
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -429,6 +438,7 @@ VULN_DB: list[BLEVuln] = [
         vuln_type="AuthBypass",
         affected_bt_type="BLE",
         requires_active_probe=True,
+        short_name="InvalidCurve",
     ),
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -445,6 +455,7 @@ VULN_DB: list[BLEVuln] = [
         severity="CRITICAL",
         vuln_type="RCE",
         affected_bt_type="Classic",
+        short_name="BlueFrag",
     ),
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -545,6 +556,7 @@ VULN_DB: list[BLEVuln] = [
         severity="HIGH",
         vuln_type="Inject",
         affected_bt_type="Any",
+        short_name="BlueDucky",
     ),
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -728,6 +740,231 @@ VULN_DB: list[BLEVuln] = [
         severity="LOW",
         vuln_type="UnauthWrite",
         affected_bt_type="BLE",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # WhisperPair (2026) — Google Fast Pair KBP auth bypass
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="CVE-2025-36911",
+        name="WhisperPair — Fast Pair Key-Based Pairing Auth Bypass",
+        description="WhisperPair: vulnerable Fast Pair accessories respond to Key-Based Pairing "
+                    "(KBP) requests even when NOT in pairing mode and without validating the ECDH "
+                    "session key. Attacker within ~14 m sends a crafted KBP write; the device leaks "
+                    "its BR/EDR address in the encrypted response, enabling tracking and full "
+                    "Bluetooth Classic pairing hijack (microphone/audio access). "
+                    "Affects Sony, Jabra, JBL, Marshall, Xiaomi, Nothing, OnePlus, Soundcore, "
+                    "Logitech, and Google's own Pixel Buds. Disclosed January 2026.",
+        affected_pattern="(?i)(sony|jabra|jbl|marshall|xiaomi|nothing.?ear|oneplus.?buds|"
+                         "soundcore|logitech|pixel.?buds|bose|anker|beats|sennheiser|"
+                         "samsung.?buds|galaxy.?buds|airpods)",
+        affected_uuids=["0000fe2c-0000-1000-8000-00805f9b34fb"],
+        severity="HIGH",
+        vuln_type="AuthBypass",
+        affected_bt_type="BLE",
+        short_name="WhisperPair",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Smart locks — BLE no-auth access
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="ADV-LOCK-001",
+        name="BLE Smart Lock Unauthenticated Access",
+        description="Multiple BLE smart locks (August, Level, Noke, Igloohome, Lockly) accept "
+                    "connections without pairing and expose lock-state or control characteristics "
+                    "without authentication. Research has demonstrated unauthenticated state reads "
+                    "and command injection on affected models.",
+        affected_pattern="(?i)(august|level.?lock|noke|igloo|lockly|schlage|kwikset|yale|kevo|"
+                         "ultraloq|smartlock|smart.?lock|doorlock|door.?lock|padlock|deadbolt|"
+                         "ttlock|elock|smart.?padlock|fingerprint.?lock)",
+        affected_uuids=[
+            "00003a77-0000-1000-8000-00805f9b34fb",  # August Smart Lock
+            "9a66f400-0800-9191-11e4-012d1540cb8e",  # Noke padlock
+        ],
+        severity="HIGH",
+        vuln_type="UnauthWrite",
+        affected_bt_type="BLE",
+        short_name="LockNoAuth",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # iBeacon / Eddystone — passive location tracking
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="ADV-IBEACON-001",
+        name="iBeacon / Eddystone Passive Location Fingerprinting",
+        description="Devices broadcasting Apple iBeacon or Google Eddystone frames disclose static "
+                    "UUID, major/minor identifiers, and calibrated TX power in every advertisement. "
+                    "These can be used to uniquely fingerprint an installation, estimate physical "
+                    "proximity, and track device movement. No connection or authentication required — "
+                    "purely passive eavesdropping. Tile trackers with non-rotating IDs are similarly "
+                    "vulnerable to persistent surveillance.",
+        affected_pattern="",
+        affected_uuids=["0000feaa-0000-1000-8000-00805f9b34fb"],  # Eddystone
+        severity="MEDIUM",
+        vuln_type="InfoDisc",
+        affected_bt_type="BLE",
+        short_name="BeaconTrack",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Medical — Medtronic insulin pump wireless auth bypass
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="CVE-2019-10964",
+        name="Medtronic MiniMed Insulin Pump Wireless Auth Bypass",
+        description="Medtronic MiniMed 508 and Paradigm insulin pumps (and the remote controller) "
+                    "communicate via a proprietary wireless protocol with no authentication. A nearby "
+                    "attacker can inject commands to change insulin dose delivery. FDA issued a safety "
+                    "alert (August 2019); affected units were recalled.",
+        affected_pattern="(?i)(medtronic|minimed|paradigm|insulin.?pump|guardian.?link|carelink|"
+                         "contour.?next|630g|670g|770g)",
+        affected_uuids=[],
+        severity="CRITICAL",
+        vuln_type="UnauthWrite",
+        affected_bt_type="Any",
+        short_name="MedtronicPump",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Medical — Abbott/St. Jude pacemaker info disclosure
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="CVE-2016-8375",
+        name="Abbott/St. Jude Medical Pacemaker Unencrypted Telemetry",
+        description="Abbott (St. Jude Medical) implantable cardiac devices expose unencrypted wireless "
+                    "telemetry without authentication. Passive eavesdropping reveals pacing parameters "
+                    "and patient data. Merlin@home programmer also affected. FDA safety advisory issued.",
+        affected_pattern="(?i)(abbott|st.?jude|merlin|pacemaker|cardiac|icd|defibrillator|"
+                         "accent|anthem|endurity|assurity|fortify|ellipse|quadra|unify)",
+        affected_uuids=[],
+        severity="HIGH",
+        vuln_type="InfoDisc",
+        affected_bt_type="Any",
+        short_name="PacemakerLeak",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Medical — continuous glucose monitors (CGM) unauth data
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="ADV-CGMS-001",
+        name="CGM Unauthenticated Glucose Data Broadcast",
+        description="Continuous Glucose Monitors (Abbott FreeStyle Libre, Dexcom G5/G6, Medtronic "
+                    "Guardian) broadcast or expose glucose readings over BLE without encryption. "
+                    "Readings can be passively captured and replayed to spoof values in monitoring apps, "
+                    "potentially leading to incorrect insulin dosing decisions.",
+        affected_pattern="(?i)(dexcom|freestyle|libre|g[567].?cgm|abbott.?diabetes|medtronic.?cgm|"
+                         "eversense|guardian|enlite|cgm|glucose.?monitor|libreview)",
+        affected_uuids=["f8083532-849e-531c-c594-30f1f86a4ea5"],  # Dexcom CGM service
+        severity="HIGH",
+        vuln_type="InfoDisc",
+        affected_bt_type="BLE",
+        short_name="CGMExposed",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Nordic UART — arbitrary command injection (extended advisory)
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="ADV-UART-002",
+        name="Nordic UART Service Arbitrary Command Injection",
+        description="Devices exposing the Nordic UART Service (NUS) without authentication allow "
+                    "an attacker to send arbitrary ASCII/binary commands and read all responses. "
+                    "Many IoT prototypes and production devices use NUS as a debug/control channel, "
+                    "enabling config dumps, setting changes, and in some cases OS shell access.",
+        affected_pattern="(?i)(nordic|nrf|uart|nus|diy|proto|dev.?board|feather|nano|seed|adafruit|"
+                         "particle|arduino.?ble|esp.?uart|bluepill|stm32.?ble)",
+        affected_uuids=["6e400001-b5a3-f393-e0a9-e50e24dcca9e"],
+        severity="HIGH",
+        vuln_type="UnauthWrite",
+        affected_bt_type="BLE",
+        short_name="UARTInject",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Android BLE heap overflow
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="CVE-2018-9358",
+        name="Android BLE Stack Heap Overflow (processConnect)",
+        description="Android Bluetooth Low Energy stack heap overflow in processConnect() — "
+                    "a malformed connection request can crash com.android.bluetooth. "
+                    "Affects Android 6.0–8.1 before 2018-06 security patch.",
+        affected_pattern="(?i)(android|samsung|galaxy|huawei|xiaomi|nexus|pixel|oppo|vivo|honor)",
+        affected_uuids=[],
+        severity="HIGH",
+        vuln_type="DoS",
+        affected_bt_type="BLE",
+        short_name="AndroidBLECrash",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLE tracker passive surveillance
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="ADV-TRACKER-001",
+        name="BLE Tracker Passive Surveillance (Tile/SmartTag)",
+        description="Bluetooth trackers (Tile, Samsung SmartTag, Chipolo) broadcast static or "
+                    "slowly-rotating identifiers that enable persistent location tracking. "
+                    "An attacker with fixed BLE scanners can map the movements of any person "
+                    "carrying a Tile or SmartTag without the victim's knowledge.",
+        affected_pattern="(?i)(tile|samsung.?tag|smart.?tag2|chipolo|nut.?smart|key.?finder|"
+                         "pebblebee|orbit|item|mynt|cube.?tracker|trackr)",
+        affected_uuids=["0000feed-0000-1000-8000-00805f9b34fb"],  # Tile service UUID
+        severity="MEDIUM",
+        vuln_type="InfoDisc",
+        affected_bt_type="BLE",
+        short_name="TrackerSurv",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Google Quick Share / Nearby Share (2024)
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="CVE-2024-38271",
+        name="Google Quick Share Forced Wi-Fi Connection",
+        description="Google Quick Share (formerly Nearby Share) on Windows forces connection to an "
+                    "attacker-controlled Wi-Fi network without user consent via a crafted BLE "
+                    "advertisement. An attacker within BLE range can redirect all network traffic.",
+        affected_pattern="(?i)(quick.?share|nearby.?share|android|pixel|google)",
+        affected_uuids=[],
+        severity="HIGH",
+        vuln_type="Spoof",
+        affected_bt_type="BLE",
+        short_name="QuickShareMITM",
+    ),
+    BLEVuln(
+        cve_id="CVE-2024-38272",
+        name="Google Quick Share File Write Without Consent",
+        description="Google Quick Share for Windows allows arbitrary file writes to any path via "
+                    "crafted BLE Nearby Share session without user confirmation. Combined with "
+                    "path traversal this achieves remote code execution.",
+        affected_pattern="(?i)(quick.?share|nearby.?share|android|pixel|google)",
+        affected_uuids=[],
+        severity="HIGH",
+        vuln_type="UnauthWrite",
+        affected_bt_type="BLE",
+        short_name="QuickShareRCE",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLE speaker unauth volume control (VCS)
+    # ══════════════════════════════════════════════════════════════════════════
+    BLEVuln(
+        cve_id="ADV-SPEAKER-002",
+        name="BLE Speaker Unauth Volume Control via VCS",
+        description="BLE speakers and soundbars implementing the Volume Control Service (0x1844) "
+                    "often do not require authentication for Volume Control Point writes. "
+                    "Any nearby device can mute, maximize volume, or set arbitrary levels.",
+        affected_pattern="(?i)(speaker|soundbar|soundlink|soundcore|jbl|bose|sony.?srs|anker|"
+                         "tribit|tronsmart|marshall|ue.?boom|flip|charge|pulse|wonder|earphone)",
+        affected_uuids=["00001844-0000-1000-8000-00805f9b34fb"],  # VCS
+        severity="LOW",
+        vuln_type="UnauthWrite",
+        affected_bt_type="BLE",
+        short_name="SpeakerVCS",
     ),
 ]
 

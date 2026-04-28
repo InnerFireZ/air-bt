@@ -21,6 +21,30 @@ from data.cve import match_vulns
 
 log = logging.getLogger("air-bt.ble")
 
+# Module-level cache so all PoC functions can resolve a BLEDevice without
+# holding a reference to the scanner.
+_BLE_DEVICE_CACHE: dict[str, "BLEDevice"] = {}
+_RANDOM_MAC_SET: set[str] = set()
+
+
+def get_cached_ble_device(mac: str) -> "BLEDevice | None":
+    """Return the most-recently-seen bleak BLEDevice for this MAC, or None."""
+    return _BLE_DEVICE_CACHE.get(mac.upper())
+
+
+def clear_cached_ble_device(mac: str) -> None:
+    """Remove a stale BLEDevice cache entry so the next attempt falls back to MAC string."""
+    _BLE_DEVICE_CACHE.pop(mac.upper(), None)
+
+
+def is_random_mac(mac: str) -> bool:
+    """
+    Return True if this MAC is a BLE random/private address.
+    Detected from the BlueZ AddressType property during scanning.
+    Random MACs (including iOS RPA) rotate after unauthenticated disconnects.
+    """
+    return mac.upper() in _RANDOM_MAC_SET
+
 
 class BLEScanner:
     def __init__(self, rssi_threshold: int = -80, adapter: str = "hci0"):
@@ -38,6 +62,17 @@ class BLEScanner:
             return
 
         mac = device.address.upper()
+
+        # Keep a fresh BLEDevice object so PoC functions can use it directly
+        # for BleakClient connections (avoids BlueZ cache-miss when scanner paused).
+        _BLE_DEVICE_CACHE[mac] = device
+
+        # Detect BLE random/private address type via BlueZ D-Bus property.
+        try:
+            if device.details.get("props", {}).get("AddressType") == "random":
+                _RANDOM_MAC_SET.add(mac)
+        except Exception:
+            pass
         name = device.name or adv.local_name or "Unknown"
 
         # Parse advertisement data
@@ -93,7 +128,7 @@ class BLEScanner:
             # Initial CVE matching from advertisement data
             vulns = match_vulns(name, adv_uuids, dev.device_type)
             if vulns:
-                dev.known_vuln = vulns[0].cve_id
+                dev.known_vuln = vulns[0].short_name or vulns[0].cve_id
                 dev.known_vuln_type = vulns[0].vuln_type
                 dev.vuln_count = len(vulns)
                 dev.matched_vulns = vulns
