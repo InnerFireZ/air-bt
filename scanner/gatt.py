@@ -16,7 +16,7 @@ from bleak.exc import BleakDeviceNotFoundError
 from bleak.backends.characteristic import BleakGATTCharacteristic
 
 from models import BTDevice, GATTService, GATTCharacteristic
-from scanner.ble import get_cached_ble_device, clear_cached_ble_device, is_random_mac
+from scanner.ble import get_cached_ble_device, clear_cached_ble_device, is_random_mac, hci_get_classic_name
 
 
 def _bleak_target(dev: BTDevice):
@@ -155,6 +155,29 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
                 except Exception:
                     pass
 
+            # Try to read the GAP Device Name characteristic (0x2A00) directly by UUID.
+            #
+            # Many devices don't properly advertise their Generic Access service (0x1800)
+            # so the char never appears in dev.all_characteristics() and the loop above
+            # misses it.  Reading by UUID string bypasses service-discovery gaps.
+            #
+            # On iOS the char is auth-gated so this silently fails — the full iPhone
+            # owner name ("John's iPhone") can only be retrieved via Bluetooth Classic
+            # HCI name resolution (see hci_get_classic_name), not BLE GATT.
+            _GAP_DEVICE_NAME = "00002a00-0000-1000-8000-00805f9b34fb"
+            _name_is_generic = dev.name in ("Unknown", "iPhone", "Android", "")
+            try:
+                raw_name = await asyncio.wait_for(
+                    client.read_gatt_char(_GAP_DEVICE_NAME), timeout=3.0
+                )
+                gatt_name = bytes(raw_name).decode("utf-8", errors="replace").strip().rstrip("\x00")
+                if gatt_name and len(gatt_name) > len(dev.name):
+                    log.info(f"Device name from 0x2A00: {dev.mac} → {gatt_name!r}")
+                    dev.name = gatt_name
+            except Exception:
+                # Auth-gated, not found, or device doesn't support it — silently skip.
+                pass
+
             # Recount open access stats
             dev.open_writes = sum(1 for c in dev.all_characteristics() if c.writable_without_auth)
             dev.open_reads = sum(1 for c in dev.all_characteristics() if c.readable_without_auth)
@@ -208,7 +231,25 @@ async def enumerate_gatt(dev: BTDevice, timeout: float = CONNECT_TIMEOUT) -> boo
                 f"open_reads={dev.open_reads} "
                 f"notifiable={dev.notifiable}"
             )
-            return True
+
+        # After disconnecting, attempt Bluetooth Classic HCI name resolution for
+        # devices still showing a generic name.  Classic BT name request works
+        # WITHOUT pairing on dual-mode devices (phones, laptops, speakers) and
+        # returns the full user-visible name ("John's iPhone") — unlike BLE GATT
+        # which is auth-gated on iOS/Android.
+        #
+        # Limitation: iPhones use a DIFFERENT MAC for Classic BT than their
+        # rotating BLE random address, so this lookup only resolves names for
+        # devices with public/static MACs (non-random).
+        if dev.name in ("Unknown", "iPhone", "Android", "") and not is_random_mac(dev.mac):
+            classic_name = await asyncio.get_event_loop().run_in_executor(
+                None, hci_get_classic_name, dev.mac
+            )
+            if classic_name:
+                log.info(f"Classic BT name resolved: {dev.mac} → {classic_name!r}")
+                dev.name = classic_name
+
+        return True
 
     except asyncio.TimeoutError:
         log.warning(f"Connection timeout: {dev.mac}")

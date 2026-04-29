@@ -12,7 +12,7 @@ air-bt passively scans BLE advertisements and **automatically connects** to ever
 
 - Open write / read / notify characteristics (no auth required)
 - Security score (A → F)
-- Matched CVEs and advisories (53 entries across all major BT attack families)
+- Matched CVEs and advisories (65 entries across all major BT attack families)
 - Battery, firmware, manufacturer info pulled live
 - Protocol detection (MiBeacon, Tuya, ELK-BLEDOM, Nordic UART, iBeacon, Govee, and more)
 
@@ -74,18 +74,104 @@ Available attacks are built **dynamically** based on what was found during probi
 
 ## Supported device PoCs
 
-| PoC | Triggered by |
-|-----|-------------|
-| ELK-BLEDOM Rainbow | ELK-BLEDOM protocol / LED strip UUIDs |
-| Audio Device | VCS / MICS / AICS / ASCS / BASS services |
-| HID Keyboard Injection | HID service with open write |
-| IoT Sensor Dump | Temperature / humidity / pressure / HR chars |
-| Smart Plug Control | GPIO / relay / switch capabilities |
-| Fitness Tracker | RSC / CSC / step counter services |
-| Health Monitor | Blood pressure / glucose / pulse ox |
-| Generic GATT Dump | Any device |
-| Systematic Write Probe | Any writable chars |
-| Auto PoC | Best match dispatched automatically |
+| PoC | Advisory / CVE | Triggered by |
+|-----|---------------|-------------|
+| ELK-BLEDOM Rainbow | ADV-ELKBLEDOM-001 | ELK-BLEDOM protocol / LED strip UUIDs |
+| Audio Device | ADV-SPEAKER-001 | VCS / MICS / AICS / ASCS / BASS services |
+| BLE Speaker Volume Control | ADV-SPEAKER-002 | VCS service or open Volume Control Point |
+| HID Keyboard Injection | CVE-2023-45866 | HID service with open write |
+| IoT Sensor Dump | — | Temperature / humidity / pressure / HR chars |
+| Smart Plug Control | — | GPIO / relay / switch capabilities |
+| Fitness Tracker | — | RSC / CSC / step counter services |
+| Health Monitor | — | Blood pressure / glucose / pulse ox |
+| Tuya BLE Control | ADV-TUYA-001 | Tuya manufacturer data / service UUIDs |
+| Govee Smart Device Control | CVE-2020-7958 | Govee name / manufacturer data |
+| MiBeacon Decoder | ADV-MIBEACON-001 | Xiaomi/Mi manufacturer data (0x0157) |
+| Nordic UART Command Injection | ADV-UART-001/002 | NUS service UUID / Nordic UART protocol |
+| Nordic DFU / OTA Exposure | ADV-DFU-001/002/003 | Nordic DFU / Silabs OTA / TI OAD service UUIDs |
+| Smart Lock Unauth Probe | ADV-LOCK-001 | Lock-related name keywords or service UUIDs |
+| iBeacon / Eddystone / Tile Decode | ADV-IBEACON-001 | Apple 0x004C manufacturer data / Eddystone / Tile |
+| SweynTooth / BrakTooth Crash Probe | CVE-2019-16336 + BrakTooth family | SweynTooth/BrakTooth CVE match |
+| Hearing Aid Unauth Probe | CVE-2019-13473/13474 | Hearing aid / medical audio services |
+| BlueBorne / BleedingTooth Info | CVE-2017-0781 + family | Detected via OS/platform type |
+| WhisperPair (Fast Pair bypass) | CVE-2025-36911 | Google Fast Pair service (0xFE2C) or name match |
+| Generic GATT Dump | — | Any device |
+| Systematic Write Probe | — | Any writable chars |
+| Auto PoC | — | Best match dispatched automatically |
+
+---
+
+## Security probes
+
+Three deeper analysis tools for finding real vulnerabilities beyond simple open-write detection.
+
+### Overflow / Boundary Probe
+
+Sweeps each writable characteristic with escalating payload sizes: `0, 1, 20, 21, 64, 128, 244, 255, 256, 512` bytes.
+
+**What it finds:**
+
+| Finding | Severity | Meaning |
+|---------|----------|---------|
+| Device crashes (no reconnect) | CRITICAL | Stack/heap overflow — firmware bug |
+| Device disconnects but recovers | HIGH | Parser instability / assertion failure |
+| Oversized write accepted | HIGH | No length enforcement (potential overflow) |
+| ATT `0x0E` Unlikely Error | HIGH | Device-side bug in attribute handler |
+| ATT `0x0D` Invalid Attribute Length | INFO | Correct enforcement in place |
+| ATT `0x05`/`0x0F` auth errors | INFO | Write requires authentication |
+
+All findings include the exact payload size, ATT error code, and crash/recover classification. The probe stops all further testing on a char if a crash is detected.
+
+---
+
+### Mutation Fuzzer
+
+Runs a configurable number of structured mutations against a single characteristic, keeping a persistent BLE connection across all iterations.
+
+**Mutation strategies** (weighted):
+
+| Strategy | Weight | Targets |
+|----------|--------|---------|
+| Bit flip | 25% | Flag fields, bitmasks |
+| Byte boundary | 25% | Integer overflows (0x00, 0xFF, 0x7F, 0x80…) |
+| Byte random | 10% | General corruption |
+| Nibble swap | 10% | Endianness / nibble-order bugs |
+| Truncate | 10% | Under-length handling |
+| Extend with zeros | 5% | Buffer overread past end |
+| Extend with 0xFF | 5% | Buffer overread / sign extension |
+| Length corruption | 5% | Length-field mismatches |
+| Zero range | 2.5% | Null-byte injection |
+| 0xFF range | 2.5% | Saturation injection |
+
+**Output:** ATT error breakdown table, per-strategy acceptance heatmap, and a highlighted list of *notable* events — disconnects, timeouts, oversized-write accepts, and unexpected ATT error codes.
+
+If the device crashes mid-run (unexpected disconnect with failed reconnect), the fuzzer marks the last payload as the crash trigger and stops.
+
+---
+
+### Reconnect Auth-Bypass Probe (BLESA-style)
+
+Tests whether a device incorrectly skips re-authentication when a client reconnects — the core weakness behind [BLESA (CVE-2020-9770)](https://dl.acm.org/doi/10.1145/3395351.3399353).
+
+**Three-phase test per characteristic:**
+
+| Phase | Gap | What it checks |
+|-------|-----|----------------|
+| Phase 1 — Baseline | — | Confirm the char is actually blocked (auth required) |
+| Phase 2 — Immediate reconnect | 0.5 s | Reconnect instantly; retry blocked operation |
+| Phase 3 — Delayed reconnect | 3.0 s | Reconnect after a pause; catch timing-window bypass |
+
+**Outcomes:**
+
+| Result | Severity | Meaning |
+|--------|----------|---------|
+| Write bypass confirmed | CRITICAL | Device skips re-auth on reconnect — unauthenticated write |
+| Read bypass confirmed | HIGH | Auth-gated data readable without pairing |
+| Timing-window bypass (Phase 3 only) | HIGH | Race condition in connection security setup |
+| Inconsistent Phase 1 | HIGH | Char appeared blocked in GATT scan but is open now |
+| No bypass found | INFO | Device correctly enforces authentication |
+
+When any bypass is confirmed, the `AUTH_BYPASS` flag is added to the device's security flags and factored into the security score.
 
 ---
 
@@ -165,23 +251,28 @@ When any bypass is confirmed, the `AUTH_BYPASS` flag is added to the device's se
 
 ## CVE database
 
-53 CVEs and advisories covering:
+**65 CVEs and advisories** covering:
 
-| Family | CVEs |
-|--------|------|
+| Family | Entries |
+|--------|---------|
 | BlueBorne | CVE-2017-1000251/1000250/0781/0782/0783/0785 |
 | BleedingTooth | CVE-2020-12351/12352/24490 |
 | BrakTooth | CVE-2021-34143/34145/34146/34147/34148 |
-| SweynTooth | CVE-2019-16336/17517/17518/17519/17520/17061 + 4 more |
+| SweynTooth | CVE-2019-16336/17517/17518/17519/17520/17061 + CVE-2021-28135/28136/28137/28138/28139 |
 | BLEEDINGBIT | CVE-2018-16986/7080 |
-| Auth attacks | KNOB / BIAS / BLUFFS / BLESA / Invalid Curve |
+| Auth attacks | KNOB (CVE-2019-9506) / BIAS (CVE-2020-10135) / BLUFFS (CVE-2023-24023) / BLESA / Invalid Curve (CVE-2018-5383) / CVE-2020-26555/26558 |
 | HID injection | CVE-2023-45866 (MouseJack / KeyDucky) |
-| Android / iOS / Windows | CVE-2020-0022 / CVE-2023-42846 / CVE-2024-21306 |
-| IoT unauth write | ELK-BLEDOM / Tuya / MiBeacon advisories |
+| Android / iOS / Windows | CVE-2020-0022 / CVE-2023-42846 / CVE-2024-21306 / CVE-2022-30190 |
+| Google Quick Share | CVE-2024-38271 (forced Wi-Fi) / CVE-2024-38272 (file write without consent) |
+| WhisperPair | CVE-2025-36911 — Fast Pair KBP auth bypass; affects Sony, Jabra, JBL, Pixel Buds + more |
+| IoT unauth access | ADV-ELKBLEDOM-001 / ADV-TUYA-001 / ADV-MIBEACON-001 / ADV-UART-001/002 |
+| OTA / Firmware | ADV-DFU-001 (Nordic) / ADV-DFU-002 (Silabs) / ADV-DFU-003 (TI OAD) |
+| Smart devices | ADV-SPEAKER-001/002 / ADV-LOCK-001 / ADV-CGMS-001 |
+| Tracking / Privacy | ADV-IBEACON-001 / ADV-TRACKER-001 |
 | Medical devices | CVE-2019-13473/13474 |
-| DoS | BLE flood / speaker crash / UART overflow |
+| DoS | ADV-BLE-FLOOD-001 / CVE-2016-8375 / CVE-2022-30190 |
 
-Each CVE has: severity (CRITICAL/HIGH/MEDIUM/LOW), type (RCE/DoS/AuthBypass/UnauthWrite/OTA/Spoof/Inject/InfoDisc), and matching logic based on device name patterns, advertised UUIDs, and BT device type.
+Each entry has: severity (CRITICAL/HIGH/MEDIUM/LOW), type (RCE/DoS/AuthBypass/UnauthWrite/OTA/Spoof/Inject/InfoDisc), and matching logic based on device name patterns, advertised UUIDs, and BT device type.
 
 ---
 

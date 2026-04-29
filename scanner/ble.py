@@ -7,6 +7,7 @@ Created by InnerFireZ — https://github.com/InnerFireZ/air-bt
 
 import asyncio
 import logging
+import subprocess
 from datetime import datetime
 
 from bleak import BleakScanner
@@ -44,6 +45,35 @@ def is_random_mac(mac: str) -> bool:
     Random MACs (including iOS RPA) rotate after unauthenticated disconnects.
     """
     return mac.upper() in _RANDOM_MAC_SET
+
+
+def hci_get_classic_name(mac: str, adapter: str = "hci0", timeout: float = 4.0) -> str | None:
+    """
+    Resolve the full Bluetooth Classic device name via HCI Remote Name Request.
+
+    This uses the Classic BT side of dual-mode devices (phones, laptops, speakers)
+    and returns the real device name (e.g. "John's iPhone") that Classic BT inquiry
+    exposes WITHOUT requiring any pairing — which is why tools like bettercap can
+    see it while BLE-only GATT enumeration cannot.
+
+    Only works for public/static MACs.  iPhones use a DIFFERENT MAC for Classic BT
+    than their rotating BLE random address, so this will NOT resolve iPhone names
+    from the BLE random MAC — you would need to find the Classic address first via
+    a Classic BT inquiry (hcitool scan).
+
+    Returns the stripped name string, or None if the lookup fails or times out.
+    """
+    try:
+        result = subprocess.run(
+            ["hcitool", "-i", adapter, "name", mac],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        name = result.stdout.strip()
+        if name and name.lower() not in ("", "n/a", "name: n/a"):
+            return name
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return None
 
 
 class BLEScanner:
