@@ -56,13 +56,16 @@ The table **adapts to terminal width** — columns are shown or hidden automatic
   2  Re-enumerate GATT
   3  Subscribe Notifications (30s)       Stream 3 notifiable chars
   4  Exploit Open Writes                 Write test payloads to 4 unauth writable chars
-  5  Fuzz Characteristics                Send random payloads (50 iterations)
-  6  IoT Sensor Dump                     Read temperature, humidity, pressure, battery
-  7  Generic GATT Dump                   Read all open chars, subscribe notifications
-  8  Systematic Write Probe              Probe with known command patterns
-  9  Auto PoC (best match)
- 10  Show CVE/Advisory details (4 entries)
- 11  Export device results
+  5  Overflow / Boundary Probe           Sweep payload sizes 0→512B; detect crashes & ATT errors
+  6  Mutation Fuzzer                     Structured seed mutations (100 iterations)
+  7  Fuzz Characteristics                Send random payloads (50 iterations)
+  8  Reconnect Auth-Bypass Probe         Test BLESA-style bypass on 3 auth-gated chars
+  9  IoT Sensor Dump                     Read temperature, humidity, pressure, battery
+ 10  Generic GATT Dump                   Read all open chars, subscribe notifications
+ 11  Systematic Write Probe              Probe with known command patterns
+ 12  Auto PoC (best match)
+ 13  Show CVE/Advisory details (4 entries)
+ 14  Export device results
 ```
 
 Available attacks are built **dynamically** based on what was found during probing — you only see options that are relevant to the specific device.
@@ -83,6 +86,80 @@ Available attacks are built **dynamically** based on what was found during probi
 | Generic GATT Dump | Any device |
 | Systematic Write Probe | Any writable chars |
 | Auto PoC | Best match dispatched automatically |
+
+---
+
+## Security probes
+
+Three deeper analysis tools for finding real vulnerabilities beyond simple open-write detection.
+
+### Overflow / Boundary Probe
+
+Sweeps each writable characteristic with escalating payload sizes: `0, 1, 20, 21, 64, 128, 244, 255, 256, 512` bytes.
+
+**What it finds:**
+
+| Finding | Severity | Meaning |
+|---------|----------|---------|
+| Device crashes (no reconnect) | CRITICAL | Stack/heap overflow — firmware bug |
+| Device disconnects but recovers | HIGH | Parser instability / assertion failure |
+| Oversized write accepted | HIGH | No length enforcement (potential overflow) |
+| ATT `0x0E` Unlikely Error | HIGH | Device-side bug in attribute handler |
+| ATT `0x0D` Invalid Attribute Length | INFO | Correct enforcement in place |
+| ATT `0x05`/`0x0F` auth errors | INFO | Write requires authentication |
+
+All findings include the exact payload size, ATT error code, and crash/recover classification. The probe stops all further testing on a char if a crash is detected.
+
+---
+
+### Mutation Fuzzer
+
+Runs a configurable number of structured mutations against a single characteristic, keeping a persistent BLE connection across all iterations.
+
+**Mutation strategies** (weighted):
+
+| Strategy | Weight | Targets |
+|----------|--------|---------|
+| Bit flip | 25% | Flag fields, bitmasks |
+| Byte boundary | 25% | Integer overflows (0x00, 0xFF, 0x7F, 0x80…) |
+| Byte random | 10% | General corruption |
+| Nibble swap | 10% | Endianness / nibble-order bugs |
+| Truncate | 10% | Under-length handling |
+| Extend with zeros | 5% | Buffer overread past end |
+| Extend with 0xFF | 5% | Buffer overread / sign extension |
+| Length corruption | 5% | Length-field mismatches |
+| Zero range | 2.5% | Null-byte injection |
+| 0xFF range | 2.5% | Saturation injection |
+
+**Output:** ATT error breakdown table, per-strategy acceptance heatmap, and a highlighted list of *notable* events — disconnects, timeouts, oversized-write accepts, and unexpected ATT error codes.
+
+If the device crashes mid-run (unexpected disconnect with failed reconnect), the fuzzer marks the last payload as the crash trigger and stops.
+
+---
+
+### Reconnect Auth-Bypass Probe (BLESA-style)
+
+Tests whether a device incorrectly skips re-authentication when a client reconnects — the core weakness behind [BLESA (CVE-2020-9770)](https://dl.acm.org/doi/10.1145/3395351.3399353).
+
+**Three-phase test per characteristic:**
+
+| Phase | Gap | What it checks |
+|-------|-----|----------------|
+| Phase 1 — Baseline | — | Confirm the char is actually blocked (auth required) |
+| Phase 2 — Immediate reconnect | 0.5 s | Reconnect instantly; retry blocked operation |
+| Phase 3 — Delayed reconnect | 3.0 s | Reconnect after a pause; catch timing-window bypass |
+
+**Outcomes:**
+
+| Result | Severity | Meaning |
+|--------|----------|---------|
+| Write bypass confirmed | CRITICAL | Device skips re-auth on reconnect — unauthenticated write |
+| Read bypass confirmed | HIGH | Auth-gated data readable without pairing |
+| Timing-window bypass (Phase 3 only) | HIGH | Race condition in connection security setup |
+| Inconsistent Phase 1 | HIGH | Char appeared blocked in GATT scan but is open now |
+| No bypass found | INFO | Device correctly enforces authentication |
+
+When any bypass is confirmed, the `AUTH_BYPASS` flag is added to the device's security flags and factored into the security score.
 
 ---
 
